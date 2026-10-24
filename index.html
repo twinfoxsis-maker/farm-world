@@ -577,13 +577,6 @@
         .active-pet-chip span { display: block; color: #a9d9af; font-size: 10px; margin-top: 2px; }
         .pet-empty-chip { padding: 10px 12px; border: 1px dashed #526653; border-radius: 12px; color: #9faf9e; font-size: 12px; }
         .pet-status-panel { margin-top: 14px; }
-        .test-tools { border-color: #715b35; background: #272319; }
-        .test-tools summary { color: #f2d79a; font-weight: 800; cursor: pointer; }
-        .test-tools-note { color: #c9bfa8; font-size: 12px; line-height: 1.5; }
-        .test-tools-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
-        .test-tools button { width: 100%; padding: 11px 8px; border: 1px solid #8c7542; border-radius: 10px; background: #43371f; color: #ffedbc; font-weight: 800; cursor: pointer; }
-        .test-tools button:hover { background: #564626; }
-        .test-tools .test-all { grid-column: 1 / -1; background: #304b35; border-color: #5f9567; color: #ddffe2; }
         .pet-shop-grid, .pet-index-grid { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 12px; }
         .pet-shop-card, .pet-index-card { display: flex; align-items: center; gap: 11px; padding: 12px; border: 1px solid #394d3c; border-radius: 14px; background: #202d23; }
         .pet-shop-card .pet-icon, .pet-index-card .pet-icon { width: 48px; height: 48px; flex-basis: 48px; }
@@ -2070,17 +2063,7 @@
                 <button id="buyPlotButton" type="button">➕ Купить грядку</button>
                 <p id="plotShopMessage">Новые грядки открываются постепенно: нужны и монеты, и достаточный уровень.</p>
             </section>
-            <details class="panel test-tools" id="testToolsPanel">
-                <summary>🧪 Инструменты тестирования</summary>
-                <p class="test-tools-note">Эти кнопки нужны только для тестирования локальной версии. Перед публичным запуском игры их необходимо удалить.</p>
-                <div class="test-tools-grid">
-                    <button type="button" data-test-currency="coins" data-test-amount="10000">➕ 10 000 монет</button>
-                    <button type="button" data-test-currency="pumpkins" data-test-amount="250">➕ 250 тыкв</button>
-                    <button type="button" data-test-currency="diamonds" data-test-amount="50">➕ 50 алмазов</button>
-                    <button type="button" class="test-all" id="testAddAllCurrencies">✨ Начислить всё: +10 000 🪙 · +250 🎃 · +50 💎</button>
-                </div>
-            </details>
-        </section>
+</section>
 
         <section class="screen" data-screen="pets" id="petsScreen" hidden>
             <div class="section-heading">
@@ -2255,7 +2238,7 @@
                 </div>
                 <button class="special-button diamond-buy-button purchase-button" id="buyExclusiveEggButton" type="button"><span class="purchase-icon" aria-hidden="true">💎</span><span class="purchase-label">Купить яйцо за 60</span></button>
                 <button class="special-button egg-button" id="openExclusiveEggButton" type="button" disabled>🥚 Открыть яйцо (0)</button>
-                <p id="exclusiveEggMessage" class="currency-note">60 💎 — тестовая цена. Повторная курочка превращается в 25 🎃.</p>
+                <p id="exclusiveEggMessage" class="currency-note">Цена яйца — 60 💎. Повторная курочка превращается в 25 🎃.</p>
             </section>
             <section class="panel" id="coinPetShopPanel" data-shop-category="pets">
                 <h2>🐾 Магазин питомцев</h2>
@@ -2855,7 +2838,6 @@
         const petIndexList = document.getElementById("petIndexList");
         const petIndexProgress = document.getElementById("petIndexProgress");
         const halloweenAvailabilityNote = document.getElementById("halloweenAvailabilityNote");
-        const testToolsPanel = document.getElementById("testToolsPanel");
         const harvestAllButton = document.getElementById("harvestAllButton");
         const warehouseStats = document.getElementById("warehouseStats");
         const warehouseValue = document.getElementById("warehouseValue");
@@ -5095,31 +5077,6 @@
             });
         });
 
-        document.getElementById("testToolsPanel").addEventListener("click", function(event) {
-            const button = event.target.closest("button[data-test-currency]");
-            if (button) {
-                const type = button.dataset.testCurrency;
-                const amount = Number(button.dataset.testAmount);
-                if (!Number.isInteger(amount) || amount <= 0) return;
-                if (type === "coins") coins += amount;
-                else if (type === "pumpkins") pumpkins += amount;
-                else if (type === "diamonds") diamonds += amount;
-                else return;
-                updateStats();
-                renderShop();
-                showMessage("🧪 Для теста начислено: +" + amount.toLocaleString("ru-RU") + " " + (type === "coins" ? "монет" : type === "pumpkins" ? "тыкв" : "алмазов") + ".");
-                return;
-            }
-            if (event.target.closest("#testAddAllCurrencies")) {
-                coins += 10000;
-                pumpkins += 250;
-                diamonds += 50;
-                updateStats();
-                renderShop();
-                showMessage("🧪 Тестовая валюта начислена: +10 000 🪙, +250 🎃 и +50 💎.");
-            }
-        });
-
         document.getElementById("diamondExchangePanel").addEventListener("click", function(event) {
             const button = event.target.closest("button[data-diamond-amount]");
             if (!button) return;
@@ -5636,12 +5593,6 @@
                 }
             } else if (profileNote) {
                 profileNote.textContent = "Telegram открыт, но профиль не получен. Попробуй открыть игру через кнопку бота.";
-            }
-
-            // Убираем удобные тестовые кнопки из интерфейса Telegram. Это не замена серверной защите.
-            if (isTelegramMiniApp) {
-                const testPanel = document.getElementById("testToolsPanel");
-                if (testPanel) testPanel.hidden = true;
             }
 
             const syncBackButton = (target) => {
