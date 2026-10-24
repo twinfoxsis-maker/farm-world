@@ -1913,10 +1913,28 @@
         @media (max-width: 420px) { .save-transfer-actions button, .save-transfer-actions label { flex: 1 1 100%; } }
         body, .game { min-height: var(--farm-viewport-height, 100vh); }
 
+
+        .cloud-save-status { margin: 6px 0 0; color: #9eafc4; font-size: .82rem; line-height: 1.4; }
+        .cloud-save-status[data-status="ok"] { color: #7ed6a1; }
+        .cloud-save-status[data-status="warning"] { color: #ffc978; }
+        .cloud-loading-overlay { position: fixed; inset: 0; z-index: 999999; display: grid; place-items: center; padding: 24px; background: rgba(8, 11, 18, .94); backdrop-filter: blur(10px); }
+        .cloud-loading-overlay[hidden] { display: none !important; }
+        .cloud-loading-card { width: min(100%, 360px); padding: 26px; text-align: center; background: #171d29; border: 1px solid #39465a; border-radius: 20px; box-shadow: 0 18px 55px #0008; color: #eef4ff; }
+        .cloud-loading-icon { display: block; margin-bottom: 10px; font-size: 2.2rem; animation: cloudPulse 1.6s ease-in-out infinite; }
+        @keyframes cloudPulse { 0%, 100% { transform: translateY(0); opacity: .8; } 50% { transform: translateY(-5px); opacity: 1; } }
+        @media (prefers-reduced-motion: reduce) { .cloud-loading-icon { animation: none; } }
+
     </style>
     <script src="https://telegram.org/js/telegram-web-app.js?64"></script>
 </head>
 <body>
+    <div class="cloud-loading-overlay" id="cloudLoadingOverlay" hidden aria-live="polite">
+        <div class="cloud-loading-card">
+            <span class="cloud-loading-icon" aria-hidden="true">☁️</span>
+            <h2>Загружаем твою ферму</h2>
+            <p>Синхронизируем сохранение. Не закрывай игру несколько секунд.</p>
+        </div>
+    </div>
     <div id="halloweenBackground" aria-hidden="true"></div>
     <div id="halloweenEffects" aria-hidden="true">
         <div class="mist-band mist-band-one"></div>
@@ -1972,6 +1990,7 @@
                     <p class="eyebrow">ТВОЯ ФЕРМА</p>
                     <h2 id="profileDisplayName">Мой профиль</h2>
                     <p class="telegram-note" id="telegramProfileNote">Локальный режим. После настройки Telegram здесь появится профиль игрока.</p>
+                    <p class="cloud-save-status" id="cloudSaveStatus" data-status="local" role="status" aria-live="polite">Локальный режим: сохранение хранится в этом браузере.</p>
                 </div>
             </div>
             <div class="profile-stats">
@@ -2369,6 +2388,18 @@
         const telegramLocalUserId = telegramUserPreview && telegramUserPreview.id !== undefined && telegramUserPreview.id !== null
             ? String(telegramUserPreview.id)
             : null;
+
+        // Облачное сохранение включается только после настройки Supabase.
+        // В браузер можно помещать только publishable key, но НЕ Telegram token и НЕ secret key.
+        const FARM_WORLD_CLOUD_CONFIG = {
+            functionUrl: "https://dgihjxhixxaxgpoborpq.supabase.co/functions/v1/farm-world",
+            publishableKey: "sb_publishable_upLbtbBgXXKvb1cxwP_kHg_y4so2gzk"    // Вставь сюда sb_publishable_... из Supabase → Settings → API Keys
+        };
+        let farmWorldCloudReady = false;
+        let farmWorldCloudSaveTimer = null;
+        let farmWorldCloudSaveInFlight = false;
+        let farmWorldCloudPendingState = null;
+        let farmWorldCloudRetryTimer = null;
 
         const crops = {
             carrot: {
@@ -3094,6 +3125,134 @@
                 localStorage.setItem(SAVE_KEY, JSON.stringify(gameData));
             } catch (error) {
                 console.warn("Не удалось сохранить игру.", error);
+            }
+            if (farmWorldCloudReady) queueFarmWorldCloudSave(gameData);
+        }
+
+
+        function farmWorldCloudConfigured() {
+            return isTelegramMiniApp &&
+                typeof FARM_WORLD_CLOUD_CONFIG.functionUrl === "string" &&
+                FARM_WORLD_CLOUD_CONFIG.functionUrl.startsWith("https://") &&
+                !FARM_WORLD_CLOUD_CONFIG.functionUrl.includes("PROJECT_REF") &&
+                typeof FARM_WORLD_CLOUD_CONFIG.publishableKey === "string" &&
+                FARM_WORLD_CLOUD_CONFIG.publishableKey.trim().length > 10;
+        }
+
+        function setFarmWorldCloudStatus(text, status = "local") {
+            const element = document.getElementById("cloudSaveStatus");
+            if (!element) return;
+            element.textContent = text;
+            element.dataset.status = status;
+        }
+
+        async function farmWorldCloudRequest(action, saveData = null, keepalive = false) {
+            if (!farmWorldCloudConfigured()) throw new Error("Облачное сохранение не настроено.");
+            const payload = { action, initData: telegramInitData };
+            if (action === "save") payload.saveData = saveData;
+            const response = await fetch(FARM_WORLD_CLOUD_CONFIG.functionUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "apikey": FARM_WORLD_CLOUD_CONFIG.publishableKey
+                },
+                body: JSON.stringify(payload),
+                keepalive
+            });
+            const result = await response.json().catch(() => null);
+            if (!response.ok || !result || result.ok !== true) {
+                const message = result && typeof result.error === "string" ? result.error : "Сервер не смог обработать запрос.";
+                throw new Error(message);
+            }
+            return result;
+        }
+
+        function queueFarmWorldCloudSave(gameData) {
+            if (!farmWorldCloudReady) return;
+            farmWorldCloudPendingState = gameData;
+            window.clearTimeout(farmWorldCloudSaveTimer);
+            window.clearTimeout(farmWorldCloudRetryTimer);
+            farmWorldCloudSaveTimer = window.setTimeout(() => flushFarmWorldCloudSave(), 1200);
+        }
+
+        async function flushFarmWorldCloudSave(options = {}) {
+            if (!farmWorldCloudReady || !farmWorldCloudPendingState || farmWorldCloudSaveInFlight) return;
+            const snapshot = farmWorldCloudPendingState;
+            farmWorldCloudPendingState = null;
+            farmWorldCloudSaveInFlight = true;
+            try {
+                await farmWorldCloudRequest("save", snapshot, options.keepalive === true);
+                setFarmWorldCloudStatus("☁️ Облачное сохранение подключено.", "ok");
+            } catch (error) {
+                console.warn("Облачное сохранение временно недоступно; локальное сохранение продолжает работать.", error);
+                if (!farmWorldCloudPendingState) farmWorldCloudPendingState = snapshot;
+                setFarmWorldCloudStatus("⚠️ Облако временно недоступно. Прогресс сохранён на устройстве; повторим синхронизацию.", "warning");
+                window.clearTimeout(farmWorldCloudRetryTimer);
+                farmWorldCloudRetryTimer = window.setTimeout(() => flushFarmWorldCloudSave(), 15000);
+            } finally {
+                farmWorldCloudSaveInFlight = false;
+                if (farmWorldCloudPendingState && !farmWorldCloudRetryTimer) {
+                    farmWorldCloudSaveTimer = window.setTimeout(() => flushFarmWorldCloudSave(), 400);
+                }
+            }
+        }
+
+        function renderFarmWorldAfterCloudLoad() {
+            checkFirstPetAchievement(false);
+            updateStats();
+            renderShop();
+            renderFarm();
+            renderDecorationArea();
+            renderDecorationShop();
+            renderAchievements();
+            renderCollectionBook();
+            renderDailyRewards();
+            renderPetUI();
+            renderPetShop();
+            renderPetUpgradeShop();
+            renderPetIndex();
+            renderWarehouse();
+            renderCropPicker();
+            renderDiamondUI();
+        }
+
+        async function initializeFarmWorldCloudSync() {
+            const overlay = document.getElementById("cloudLoadingOverlay");
+            if (!farmWorldCloudConfigured()) {
+                setFarmWorldCloudStatus(
+                    isTelegramMiniApp
+                        ? "Локальное сохранение работает. Облачная база ещё не подключена."
+                        : "Локальный режим: сохранение хранится в этом браузере.",
+                    "local"
+                );
+                return;
+            }
+
+            if (overlay) overlay.hidden = false;
+            setFarmWorldCloudStatus("☁️ Подключаем облачное сохранение…", "local");
+            try {
+                const response = await farmWorldCloudRequest("load");
+                if (response.saveData && typeof response.saveData === "object" && !Array.isArray(response.saveData)) {
+                    // Существующая облачная запись имеет приоритет над локальной копией.
+                    localStorage.setItem(SAVE_KEY, JSON.stringify(response.saveData));
+                    loadGame();
+                    renderFarmWorldAfterCloudLoad();
+                    setFarmWorldCloudStatus("☁️ Ферма загружена из облака.", "ok");
+                    farmWorldCloudReady = true;
+                    saveGame();
+                } else {
+                    // Первая запись для этого Telegram-аккаунта: переносим локальный прогресс в облако.
+                    farmWorldCloudReady = true;
+                    setFarmWorldCloudStatus("☁️ Переносим текущую ферму в облако…", "local");
+                    saveGame();
+                    await flushFarmWorldCloudSave();
+                }
+            } catch (error) {
+                console.error("Не удалось подключить облачное сохранение.", error);
+                farmWorldCloudReady = false;
+                setFarmWorldCloudStatus("⚠️ Не удалось подключить облако. Игра продолжает работать с локальным сохранением.", "warning");
+            } finally {
+                if (overlay) overlay.hidden = true;
             }
         }
 
@@ -5568,7 +5727,7 @@
                 if (profileName) profileName.textContent = displayName;
                 if (profileNote) {
                     profileNote.textContent = (telegramUserPreview.username ? "@" + telegramUserPreview.username + " · " : "") +
-                        "Профиль показан из Telegram. Пока прогресс хранится на этом устройстве, не на сервере.";
+                        "Профиль получен из Telegram. Статус синхронизации показан ниже.";
                 }
 
                 const photoUrl = typeof telegramUserPreview.photo_url === "string" ? telegramUserPreview.photo_url : "";
@@ -5681,6 +5840,12 @@
                         importInput.value = "";
                         return;
                     }
+                    // В Telegram импорт должен обновить и локальный ключ, и облачную запись,
+                    // иначе при перезагрузке облако могло бы вернуть более старое сохранение.
+                    if (farmWorldCloudConfigured() && isTelegramMiniApp) {
+                        status.textContent = "☁️ Переносим резервную копию в облако…";
+                        await farmWorldCloudRequest("save", data);
+                    }
                     localStorage.setItem(SAVE_KEY, JSON.stringify(data));
                     status.textContent = "✅ Сохранение импортировано. Перезагружаем игру…";
                     window.setTimeout(() => window.location.reload(), 300);
@@ -5706,6 +5871,7 @@
         renderShop();
         renderFarm();
         initializeTelegramMiniApp();
+        void initializeFarmWorldCloudSync();
         setInterval(renderFarm, 1000);
         setInterval(tickPlaytime, 15000);
 
@@ -5716,6 +5882,14 @@
             lastPlaytimeTick = Date.now();
             if (document.visibilityState === "visible") registerActivePlay();
             saveGame();
+            if (document.visibilityState === "hidden" && farmWorldCloudReady) {
+                window.clearTimeout(farmWorldCloudSaveTimer);
+                void flushFarmWorldCloudSave({ keepalive: true });
+            }
+        });
+        window.addEventListener("pagehide", function() {
+            saveGame();
+            if (farmWorldCloudReady) void flushFarmWorldCloudSave({ keepalive: true });
         });
         window.addEventListener("beforeunload", saveGame);
     </script>
