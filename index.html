@@ -2297,7 +2297,7 @@
         <section class="screen" data-screen="quests" id="questsScreen" hidden>
             <div class="section-heading">
                 <h2>📜 Задания</h2>
-                <p>Выполняй задания, собирай урожай и получай награды. Прогресс текущей версии сохраняется в этом браузере.</p>
+                <p>Выполняй задания, собирай урожай и получай награды. В Telegram прогресс проверяется сервером и хранится в облаке; вне Telegram работает локальное сохранение.</p>
             </div>
             <div class="daily-gift-quest-shortcut">
                 <button class="daily-gift-open" type="button" data-open-daily-rewards>🎁 Ежедневные подарки</button>
@@ -2393,7 +2393,7 @@
         // В браузер можно помещать только publishable key, но НЕ Telegram token и НЕ secret key.
         const FARM_WORLD_CLOUD_CONFIG = {
             functionUrl: "https://dgihjxhixxaxgpoborpq.supabase.co/functions/v1/farm-world",
-            publishableKey: "sb_publishable_upLbtbBgXXKvb1cxwP_kHg_y4so2gzk"    // Вставь сюда sb_publishable_... из Supabase → Settings → API Keys
+            publishableKey: "sb_publishable_upLbtbBgXXKvb1cxwP_kHg_y4so2gzk"
         };
         let farmWorldCloudReady = false;
         let farmWorldCloudSaveTimer = null;
@@ -3012,12 +3012,19 @@
             if (previousDate !== playtimeDate) saveGame();
 
             const isActivelyPlaying = document.visibilityState === "visible" && now - lastActivityAt <= 2 * 60 * 1000;
+            if (farmWorldCloudAuthorityRequired()) {
+                // В Telegram начисление алмазов подтверждается сервером по последовательным активным heartbeat.
+                if (isActivelyPlaying && farmWorldCloudReady && now >= farmWorldNextHeartbeatAttemptAt && now - farmWorldLastHeartbeatRequestAt >= 14000) {
+                    farmWorldLastHeartbeatRequestAt = now;
+                    void executeFarmWorldCommand("playtime_heartbeat", { active: true }, { silent: true, render: false });
+                }
+                renderDiamondUI();
+                return;
+            }
+
             if (isActivelyPlaying && diamondsEarnedToday < MAX_PLAYTIME_DIAMONDS_PER_DAY) {
                 playtimeMsToday = Math.min(MAX_PLAYTIME_DIAMONDS_PER_DAY * PLAYTIME_DIAMOND_INTERVAL, playtimeMsToday + elapsed);
-                const shouldHaveEarned = Math.min(
-                    MAX_PLAYTIME_DIAMONDS_PER_DAY,
-                    Math.floor(playtimeMsToday / PLAYTIME_DIAMOND_INTERVAL)
-                );
+                const shouldHaveEarned = Math.min(MAX_PLAYTIME_DIAMONDS_PER_DAY, Math.floor(playtimeMsToday / PLAYTIME_DIAMOND_INTERVAL));
                 if (shouldHaveEarned > diamondsEarnedToday) {
                     const newlyEarned = shouldHaveEarned - diamondsEarnedToday;
                     diamonds += newlyEarned;
@@ -3126,7 +3133,8 @@
             } catch (error) {
                 console.warn("Не удалось сохранить игру.", error);
             }
-            if (farmWorldCloudReady) queueFarmWorldCloudSave(gameData);
+            // В облаке изменения записываются только серверными командами.
+            // saveGame сохраняет локальный кэш для быстрого отображения/резервной копии.
         }
 
 
@@ -3146,10 +3154,14 @@
             element.dataset.status = status;
         }
 
-        async function farmWorldCloudRequest(action, saveData = null, keepalive = false) {
+        async function farmWorldCloudRequest(action, options = {}) {
             if (!farmWorldCloudConfigured()) throw new Error("Облачное сохранение не настроено.");
             const payload = { action, initData: telegramInitData };
-            if (action === "save") payload.saveData = saveData;
+            if (action === "command") {
+                payload.command = options.command;
+                payload.payload = options.payload || {};
+                payload.requestId = options.requestId;
+            }
             const response = await fetch(FARM_WORLD_CLOUD_CONFIG.functionUrl, {
                 method: "POST",
                 headers: {
@@ -3157,48 +3169,116 @@
                     "apikey": FARM_WORLD_CLOUD_CONFIG.publishableKey
                 },
                 body: JSON.stringify(payload),
-                keepalive
+                keepalive: options.keepalive === true
             });
             const result = await response.json().catch(() => null);
             if (!response.ok || !result || result.ok !== true) {
-                const message = result && typeof result.error === "string" ? result.error : "Сервер не смог обработать запрос.";
-                throw new Error(message);
+                const error = new Error(result && typeof result.error === "string" ? result.error : "Сервер не смог обработать запрос.");
+                error.code = result && typeof result.code === "string" ? result.code : "REQUEST_FAILED";
+                error.retryAfterSeconds = result && Number.isFinite(result.retryAfterSeconds) ? result.retryAfterSeconds : 0;
+                error.status = response.status;
+                throw error;
             }
             return result;
         }
 
-        function queueFarmWorldCloudSave(gameData) {
-            if (!farmWorldCloudReady) return;
-            farmWorldCloudPendingState = gameData;
-            window.clearTimeout(farmWorldCloudSaveTimer);
-            window.clearTimeout(farmWorldCloudRetryTimer);
-            farmWorldCloudSaveTimer = window.setTimeout(() => flushFarmWorldCloudSave(), 1200);
+        function farmWorldCloudAuthorityRequired() {
+            // When opened inside Telegram, NEVER fall back to client-side economy mutations.
+            // If cloud config or sync is unavailable, commands remain blocked rather than
+            // allowing currency/items to be edited locally and later mistaken for trusted state.
+            return isTelegramMiniApp;
         }
 
-        async function flushFarmWorldCloudSave(options = {}) {
-            if (!farmWorldCloudReady || !farmWorldCloudPendingState || farmWorldCloudSaveInFlight) return;
-            const snapshot = farmWorldCloudPendingState;
-            farmWorldCloudPendingState = null;
-            farmWorldCloudSaveInFlight = true;
-            try {
-                await farmWorldCloudRequest("save", snapshot, options.keepalive === true);
-                setFarmWorldCloudStatus("☁️ Облачное сохранение подключено.", "ok");
-            } catch (error) {
-                console.warn("Облачное сохранение временно недоступно; локальное сохранение продолжает работать.", error);
-                if (!farmWorldCloudPendingState) farmWorldCloudPendingState = snapshot;
-                setFarmWorldCloudStatus("⚠️ Облако временно недоступно. Прогресс сохранён на устройстве; повторим синхронизацию.", "warning");
-                window.clearTimeout(farmWorldCloudRetryTimer);
-                farmWorldCloudRetryTimer = window.setTimeout(() => flushFarmWorldCloudSave(), 15000);
-            } finally {
-                farmWorldCloudSaveInFlight = false;
-                if (farmWorldCloudPendingState && !farmWorldCloudRetryTimer) {
-                    farmWorldCloudSaveTimer = window.setTimeout(() => flushFarmWorldCloudSave(), 400);
+        let farmWorldServerCommandQueue = Promise.resolve();
+        let farmWorldLastHeartbeatRequestAt = 0;
+        let farmWorldNextHeartbeatAttemptAt = 0;
+
+        function makeFarmWorldRequestId() {
+            if (window.crypto && typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID().replace(/-/g, "_");
+            return "fw_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 18);
+        }
+
+        function queueFarmWorldCloudSave() {
+            // Полные снимки от клиента больше не отправляются в облако.
+            // В Telegram все экономические изменения проходят через серверные команды.
+        }
+
+        async function flushFarmWorldCloudSave() {
+            // Совместимость со старыми обработчиками pagehide/visibilitychange.
+            // Каноническое состояние уже сохранено серверной командой.
+        }
+
+        function executeFarmWorldCommand(command, payload = {}, options = {}) {
+            if (!farmWorldCloudAuthorityRequired()) return Promise.resolve(false);
+            const run = async () => {
+                if (!farmWorldCloudReady) {
+                    if (!options.silent) showMessage("☁️ Облако ещё подключается. Действие пока не выполнено — попробуй через несколько секунд.");
+                    return false;
                 }
-            }
+                try {
+                    // Reuse one idempotency key for retry attempts. If the server committed a
+                    // command but the response was lost, it can return the saved result without
+                    // charging the player twice.
+                    const requestId = makeFarmWorldRequestId();
+                    let result = null;
+                    for (let attempt = 0; attempt < 3; attempt++) {
+                        try {
+                            result = await farmWorldCloudRequest("command", {
+                                command,
+                                payload,
+                                requestId,
+                                keepalive: options.keepalive === true
+                            });
+                            break;
+                        } catch (requestError) {
+                            const transient = !requestError.status || requestError.status >= 500;
+                            if (!transient || attempt === 2) throw requestError;
+                            await new Promise(resolve => window.setTimeout(resolve, 250 * (attempt + 1)));
+                        }
+                    }
+                    if (!result || !result.saveData || typeof result.saveData !== "object") throw new Error("Сервер не вернул сохранение фермы.");
+                    try {
+                        localStorage.setItem(SAVE_KEY, JSON.stringify(result.saveData));
+                    } catch (storageError) {
+                        console.warn("Не удалось обновить локальный кэш; облачное сохранение уже обработано сервером.", storageError);
+                    }
+                    loadGame();
+                    if (options.render === false) {
+                        updateStats();
+                        renderDiamondUI();
+                    } else {
+                        renderFarmWorldAfterCloudLoad();
+                    }
+                    if (command === "plant" && result.notice && result.notice.startsWith("Посажено:")) closeCropPicker(false);
+                    if (command === "claim_daily_reward") closeDailyRewardsModal(false);
+                    if (Array.isArray(result.harvested)) {
+                        result.harvested.forEach((item, index) => {
+                            if (!item || !Number.isInteger(item.index) || typeof item.cropId !== "string") return;
+                            window.setTimeout(() => playHarvestAnimation(item.index, item.cropId, Number(item.pumpkinsGained) || 0), Math.min(index * 42, 650));
+                        });
+                    }
+                    if (Array.isArray(result.rewards)) result.rewards.forEach(reward => queueReward(reward));
+                    if (result.notice && !options.silent) showMessage(result.notice);
+                    setFarmWorldCloudStatus("☁️ Облачное сохранение и серверные игровые действия подключены.", "ok");
+                    return true;
+                } catch (error) {
+                    if (command === "playtime_heartbeat" && (error.code === "GAME_RULE" || error.code === "COOLDOWN")) {
+                        farmWorldNextHeartbeatAttemptAt = Date.now() + Math.max(15000, Number(error.retryAfterSeconds || 15) * 1000);
+                        return false;
+                    }
+                    console.error("Не удалось выполнить серверную команду Farm World:", command, error);
+                    setFarmWorldCloudStatus("⚠️ Не удалось подтвердить действие в облаке. Прогресс не изменён.", "warning");
+                    if (!options.silent) showMessage("Не удалось выполнить действие: " + (error && error.message ? error.message : "ошибка соединения") + ". Попробуй ещё раз.");
+                    return false;
+                }
+            };
+            const queued = farmWorldServerCommandQueue.then(run, run);
+            farmWorldServerCommandQueue = queued.then(() => undefined, () => undefined);
+            return queued;
         }
 
         function renderFarmWorldAfterCloudLoad() {
-            checkFirstPetAchievement(false);
+            if (!farmWorldCloudAuthorityRequired()) checkFirstPetAchievement(false);
             updateStats();
             renderShop();
             renderFarm();
@@ -3221,7 +3301,7 @@
             if (!farmWorldCloudConfigured()) {
                 setFarmWorldCloudStatus(
                     isTelegramMiniApp
-                        ? "Локальное сохранение работает. Облачная база ещё не подключена."
+                        ? "Облако не настроено. В Telegram игровые действия заблокированы до подключения сервера."
                         : "Локальный режим: сохранение хранится в этом браузере.",
                     "local"
                 );
@@ -3229,28 +3309,21 @@
             }
 
             if (overlay) overlay.hidden = false;
-            setFarmWorldCloudStatus("☁️ Подключаем облачное сохранение…", "local");
+            setFarmWorldCloudStatus("☁️ Проверяем аккаунт и загружаем ферму…", "local");
             try {
                 const response = await farmWorldCloudRequest("load");
-                if (response.saveData && typeof response.saveData === "object" && !Array.isArray(response.saveData)) {
-                    // Существующая облачная запись имеет приоритет над локальной копией.
-                    localStorage.setItem(SAVE_KEY, JSON.stringify(response.saveData));
-                    loadGame();
-                    renderFarmWorldAfterCloudLoad();
-                    setFarmWorldCloudStatus("☁️ Ферма загружена из облака.", "ok");
-                    farmWorldCloudReady = true;
-                    saveGame();
-                } else {
-                    // Первая запись для этого Telegram-аккаунта: переносим локальный прогресс в облако.
-                    farmWorldCloudReady = true;
-                    setFarmWorldCloudStatus("☁️ Переносим текущую ферму в облако…", "local");
-                    saveGame();
-                    await flushFarmWorldCloudSave();
+                if (!response.saveData || typeof response.saveData !== "object" || Array.isArray(response.saveData)) {
+                    throw new Error("Сервер не вернул данные фермы.");
                 }
+                localStorage.setItem(SAVE_KEY, JSON.stringify(response.saveData));
+                loadGame();
+                farmWorldCloudReady = true;
+                renderFarmWorldAfterCloudLoad();
+                setFarmWorldCloudStatus("☁️ Облачное сохранение и серверные игровые действия подключены.", "ok");
             } catch (error) {
                 console.error("Не удалось подключить облачное сохранение.", error);
                 farmWorldCloudReady = false;
-                setFarmWorldCloudStatus("⚠️ Не удалось подключить облако. Игра продолжает работать с локальным сохранением.", "warning");
+                setFarmWorldCloudStatus("⚠️ Не удалось подключить облако. В Telegram экономические действия не выполняются, чтобы не потерять прогресс.", "warning");
             } finally {
                 if (overlay) overlay.hidden = true;
             }
@@ -3572,6 +3645,7 @@
         }
 
         function upgradeOwnedPet(petId) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("upgrade_pet", { petId }); return true; }
             if (!ownedPets.includes(petId) || !petDefinitions[petId]) return false;
             const currentLevel = getPetLevel(petId);
             const cost = getPetUpgradeCost(petId);
@@ -3881,6 +3955,7 @@
         }
 
         function purchaseDecoration(decorId) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("buy_decoration", { decorId }); return; }
             const decor = decorationDefinitions[decorId];
             if (!decor) return;
             if (level < decor.levelRequired) {
@@ -3910,6 +3985,7 @@
         }
 
         function placeDecoration(decorId) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("place_decoration", { decorId }); return; }
             const decor = decorationDefinitions[decorId];
             if (!decor || !(decorationInventory[decorId] > 0)) return;
             const slotCount = getUnlockedDecorationSlots();
@@ -3926,6 +4002,7 @@
         }
 
         function removeDecoration(slotIndex) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("remove_decoration", { slotIndex }); return; }
             if (!Number.isInteger(slotIndex) || slotIndex < 0 || slotIndex >= getUnlockedDecorationSlots()) return;
             const decorId = placedDecorations[slotIndex];
             if (!decorId || !decorationDefinitions[decorId]) return;
@@ -4036,6 +4113,7 @@
         }
 
         function claimAchievement(achievementId) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("claim_achievement", { id: achievementId }); return; }
             const achievement = achievementDefinitions.find(item => item.id === achievementId);
             if (!achievement || achievementSystem.claimed[achievementId] === true) return;
             if (getAchievementProgress(achievement) < achievement.target) {
@@ -4239,6 +4317,7 @@
         }
 
         function claimDailyReward(index) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("claim_daily_reward", { index }); return; }
             if (!Number.isInteger(index) || index < 0 || index >= DAILY_LOGIN_REWARDS.length) return;
             const today = getTodayDate();
             if (dailyRewardsSystem.lastClaimDate === today) {
@@ -4412,6 +4491,7 @@
         }
 
         function plantCropAtPlot(plotIndex, cropId) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("plant", { plotIndex, cropId }); return true; }
             const plot = plots[plotIndex];
             const crop = crops[cropId];
             if (!plot || plot.crop !== null || !crop) return false;
@@ -4878,6 +4958,7 @@
         }
 
         function sellInventoryCrop(cropId) {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("sell_crop", { cropId }); return; }
             const crop = crops[cropId];
             const amount = harvestInventory[cropId] || 0;
             if (!crop || amount <= 0) return;
@@ -4892,6 +4973,7 @@
         }
 
         function sellAllInventory() {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("sell_all"); return; }
             const used = warehouseUsed();
             if (used <= 0) {
                 warehouseMessage.textContent = "Амбар пока пуст. Сначала собери урожай.";
@@ -4912,6 +4994,7 @@
         }
 
         function upgradeWarehouse() {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("upgrade_warehouse"); return; }
             const cost = WAREHOUSE_UPGRADE_COSTS[warehouseLevel - 1];
             if (cost === undefined) return;
             if (coins < cost) {
@@ -4926,6 +5009,7 @@
         }
 
         function harvestAllReady() {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("harvest_all"); return; }
             const readyIndices = plots.map((plot, index) => ({ plot, index }))
                 .filter(({ plot }) => plot.crop && Date.now() - plot.plantedAt >= (plot.growTimeMs || crops[plot.crop].growTime))
                 .map(({ index }) => index);
@@ -5131,6 +5215,7 @@
             const button = event.target.closest(".seed");
             if (!button || button.disabled) return;
 
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("select_crop", { cropId: button.dataset.crop }); return; }
             selectedCrop = button.dataset.crop;
             renderShop();
             saveGame();
@@ -5142,6 +5227,7 @@
             if (!button || button.disabled) return;
 
             const id = button.dataset.questId;
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("claim_quest", { id }); return; }
 
             if (id === "daily") {
                 refreshDailyQuest();
@@ -5171,6 +5257,7 @@
         });
 
         buyPumpkinPetButton.addEventListener("click", function() {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("buy_halloween_pet"); return; }
             if (ownedPets.includes("halloweenPumpkin")) {
                 showMessage("🎃 Тыква-дух уже в твоей коллекции!");
                 return;
@@ -5207,6 +5294,7 @@
             const button = event.target.closest("button[data-buy-pet]");
             if (!button) return;
             const petId = button.dataset.buyPet;
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("buy_pet", { petId }); return; }
             const pet = petDefinitions[petId];
             if (!pet || !Number.isFinite(pet.priceCoins)) return;
             if (ownedPets.includes(petId)) {
@@ -5241,6 +5329,7 @@
             if (!button) return;
             const amount = Number(button.dataset.diamondAmount);
             const price = Number(button.dataset.coinPrice);
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("exchange_diamonds", { amount }); return; }
             if (!Number.isInteger(amount) || amount <= 0 || !Number.isInteger(price) || price < 0) return;
             if (coins < price) {
                 showMessage("🪙 Не хватает монет для обмена на алмазы.");
@@ -5254,6 +5343,7 @@
         });
 
         buyExclusiveEggButton.addEventListener("click", function() {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("buy_egg"); return; }
             if (diamonds < EXCLUSIVE_EGG_PRICE) {
                 showMessage("Нужно " + EXCLUSIVE_EGG_PRICE + " 💎 для покупки эксклюзивного яйца.");
                 return;
@@ -5266,6 +5356,7 @@
         });
 
         openExclusiveEggButton.addEventListener("click", function() {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("open_egg"); return; }
             if (exclusiveEggs < 1) {
                 showMessage("Сначала купи эксклюзивное яйцо за алмазы.");
                 return;
@@ -5296,6 +5387,7 @@
 
         // Беленькая курочка выдаётся за первое долгосрочное достижение, а не через случайное яйцо.
         function checkFirstPetAchievement(showCelebration = true) {
+            if (farmWorldCloudAuthorityRequired()) return false;
             const totalHarvests = Object.values(harvests).reduce((sum, count) => sum + count, 0);
             if (totalHarvests >= 10 && !ownedPets.includes("whiteChicken")) {
                 ownedPets.push("whiteChicken");
@@ -5342,6 +5434,7 @@
             if (!button) return;
             const petId = button.dataset.petAction;
             if (!ownedPets.includes(petId) || !petDefinitions[petId]) return;
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("toggle_pet", { petId }); return; }
 
             if (activePets.includes(petId)) {
                 activePets = activePets.filter(id => id !== petId);
@@ -5364,6 +5457,7 @@
         });
 
         buyPlotButton.addEventListener("click", function() {
+            if (farmWorldCloudAuthorityRequired()) { void executeFarmWorldCommand("buy_plot"); return; }
             if (plots.length >= MAX_PLOTS) {
                 plotShopMessage.textContent = "Достигнут предел в " + MAX_PLOTS + " грядок для текущей версии.";
                 return;
@@ -5402,6 +5496,9 @@
 
             if (plot.crop === null) {
                 openCropPicker(index, button);
+                return;
+            } else if (farmWorldCloudAuthorityRequired()) {
+                void executeFarmWorldCommand("harvest", { plotIndex: index });
                 return;
             } else {
                 const crop = crops[plot.crop];
@@ -5727,7 +5824,7 @@
                 if (profileName) profileName.textContent = displayName;
                 if (profileNote) {
                     profileNote.textContent = (telegramUserPreview.username ? "@" + telegramUserPreview.username + " · " : "") +
-                        "Профиль получен из Telegram. Статус синхронизации показан ниже.";
+                        "Профиль получен из Telegram. Игровые действия подтверждаются сервером.";
                 }
 
                 const photoUrl = typeof telegramUserPreview.photo_url === "string" ? telegramUserPreview.photo_url : "";
@@ -5820,6 +5917,11 @@
             importInput.addEventListener("change", async function() {
                 const file = importInput.files && importInput.files[0];
                 if (!file) return;
+                if (farmWorldCloudAuthorityRequired()) {
+                    status.textContent = "Импорт резервной копии отключён в Telegram, чтобы нельзя было подменить валюту и предметы. Экспорт резервной копии доступен.";
+                    importInput.value = "";
+                    return;
+                }
                 try {
                     if (file.size > 2 * 1024 * 1024) throw new Error("Файл слишком большой.");
                     const text = await file.text();
@@ -5839,12 +5941,6 @@
                     if (!importConfirmed) {
                         importInput.value = "";
                         return;
-                    }
-                    // В Telegram импорт должен обновить и локальный ключ, и облачную запись,
-                    // иначе при перезагрузке облако могло бы вернуть более старое сохранение.
-                    if (farmWorldCloudConfigured() && isTelegramMiniApp) {
-                        status.textContent = "☁️ Переносим резервную копию в облако…";
-                        await farmWorldCloudRequest("save", data);
                     }
                     localStorage.setItem(SAVE_KEY, JSON.stringify(data));
                     status.textContent = "✅ Сохранение импортировано. Перезагружаем игру…";
